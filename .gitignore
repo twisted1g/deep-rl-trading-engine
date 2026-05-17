@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+models/*.zip
+!models/.gitkeep
+logs/
+*.log
+.DS_Store

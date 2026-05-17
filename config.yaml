@@ -1,0 +1,29 @@
+exchange:
+  testnet: true
+  symbol: BTCUSDT
+  interval: 1m          # 1m, 5m, 15m, 1h, ...
+  leverage: 1
+  margin_type: ISOLATED # ISOLATED | CROSSED
+
+model:
+  path: models/agent.zip
+  deterministic: true
+
+trading:
+  window_size: 64          # сколько последних свечей подавать в observation
+  poll_seconds: 5          # как часто опрашивать рынок внутри одной свечи
+  order_quantity: 0.001    # размер позиции в базовой валюте (BTC)
+  action_space: discrete   # discrete | continuous
+  # discrete: 0=hold, 1=long, 2=short, 3=close
+  max_position: 1          # |позиция| в единицах order_quantity
+
+features:
+  ohlcv: true
+  indicators:
+    - rsi_14
+    - ema_12
+    - ema_26
+    - macd
+    - atr_14
+    - bb_20
+  normalize: zscore        # none | zscore | minmax
