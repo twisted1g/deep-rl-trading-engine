@@ -1,29 +1,27 @@
 exchange:
   testnet: true
   symbol: BTCUSDT
-  interval: 1m          # 1m, 5m, 15m, 1h, ...
+  interval: 1h
   leverage: 1
-  margin_type: ISOLATED # ISOLATED | CROSSED
+  margin_type: ISOLATED
 
 model:
-  path: models/agent.zip
-  deterministic: true
+  experiment_dir: ../DeepRLTradingResearch/experiments/a2c-baseline/20260517-153458-f0cb0e
+  algo: a2c
+  state_space: baseline
+
+  lstm_checkpoint_path: ../DeepRLTradingResearch/src/encoders/lstm_encoder.pt
+  lstm_device: cpu
+
+env:
+  feature_window: 20
+  lstm_window_size: 128
+  lstm_hidden_size: 64
+  lstm_layers: 2
 
 trading:
-  window_size: 64          # сколько последних свечей подавать в observation
-  poll_seconds: 5          # как часто опрашивать рынок внутри одной свечи
-  order_quantity: 0.001    # размер позиции в базовой валюте (BTC)
-  action_space: discrete   # discrete | continuous
-  # discrete: 0=hold, 1=long, 2=short, 3=close
-  max_position: 1          # |позиция| в единицах order_quantity
-
-features:
-  ohlcv: true
-  indicators:
-    - rsi_14
-    - ema_12
-    - ema_26
-    - macd
-    - atr_14
-    - bb_20
-  normalize: zscore        # none | zscore | minmax
+  equity_fraction: 1.0
+  max_holding_time: 72
+  max_drawdown_threshold: 0.08
+  poll_seconds: 30
+  bar_close_grace_seconds: 5
