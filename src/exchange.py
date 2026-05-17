@@ -82,6 +82,23 @@ class BinanceFutures:
                 return float(b["balance"])
         return 0.0
 
+    def quantity_step(self) -> float:
+        info = self.client.futures_exchange_info()
+        for s in info["symbols"]:
+            if s["symbol"] == self.symbol:
+                for f in s["filters"]:
+                    if f["filterType"] == "LOT_SIZE":
+                        return float(f["stepSize"])
+        return 0.001
+
+    def round_quantity(self, qty: float) -> float:
+        step = self.quantity_step()
+        if step <= 0:
+            return qty
+        # floor к ближайшему кратному step
+        n = int(qty / step)
+        return round(n * step, 8)
+
 
     def market_order(self, side: str, quantity: float, reduce_only: bool = False) -> dict:
         assert side in ("BUY", "SELL")
