@@ -3,7 +3,7 @@ exchange:
   # Hyperliquid: тикер монеты без quote-суффикса (BTC, ETH, SOL).
   # Код принимает и BTCUSDT/BTC-USDT — конвертирует в BTC автоматически.
   symbol: BTC
-  interval: 1m
+  interval: 5m
   leverage: 1
   # Hyperliquid: CROSS / ISOLATED.
   margin_type: CROSS
