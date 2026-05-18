@@ -2,23 +2,38 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
+import signal
 import sys
 from pathlib import Path
+
+from typing import Optional
 
 import yaml
 from dotenv import load_dotenv
 
 from src.exchange import from_env
+from src.journal import TradeJournal
 from src.model_loader import load_model_and_vecnorm
+from src.notifier import TelegramNotifier
 from src.observation import ObservationBuilder
 from src.trader import Trader, TraderConfig
 
 
-def setup_logging() -> None:
+def setup_logging(log_dir: Optional[str] = "state/logs") -> None:
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    if log_dir:
+        from logging.handlers import RotatingFileHandler
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(
+            Path(log_dir) / "engine.log",
+            maxBytes=10 * 1024 * 1024, backupCount=5,
+        ))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-        stream=sys.stdout,
+        handlers=handlers,
+        force=True,
     )
 
 
@@ -45,9 +60,7 @@ def main() -> None:
         lstm_device=cfg["model"].get("lstm_device", "cpu"),
     )
 
-    obs_dim = (
-        6 if state_space == "baseline" else cfg["env"].get("lstm_hidden_size", 64)
-    )
+    obs_dim = obs_builder.obs_dim
 
     exp_dir = Path(cfg["model"]["experiment_dir"]).expanduser().resolve()
     model, vec_env = load_model_and_vecnorm(
@@ -75,7 +88,52 @@ def main() -> None:
         bar_close_grace_seconds=cfg["trading"]["bar_close_grace_seconds"],
     )
 
-    trader = Trader(ex, obs_builder, model, vec_env, tcfg)
+    tg_cfg = cfg.get("telegram", {}) or {}
+    notifier = TelegramNotifier.from_env(
+        enabled=tg_cfg.get("enabled", False),
+        chat_id=tg_cfg.get("chat_id"),
+    )
+
+    persistence_cfg = cfg.get("persistence", {}) or {}
+    journal = TradeJournal(persistence_cfg.get("db_path", "state/trades.db"))
+
+    trader = Trader(ex, obs_builder, model, vec_env, tcfg,
+                    notifier=notifier, journal=journal)
+    notifier.notify_startup(
+        f"{tcfg.symbol} {tcfg.interval} | algo={cfg['model']['algo']} "
+        f"state={cfg['model']['state_space']} testnet={cfg['exchange']['testnet']}"
+    )
+
+    if (
+        tg_cfg.get("commands_enabled", False)
+        and tg_cfg.get("enabled", False)
+        and os.environ.get("TELEGRAM_BOT_TOKEN")
+        and (tg_cfg.get("chat_id") or os.environ.get("TELEGRAM_CHAT_ID"))
+        and not args.once
+    ):
+        from src.tg_bot import CommandBot
+        bot = CommandBot(
+            token=os.environ["TELEGRAM_BOT_TOKEN"],
+            chat_id=int(tg_cfg.get("chat_id") or os.environ["TELEGRAM_CHAT_ID"]),
+            trader=trader,
+            journal=journal,
+        )
+        bot.start()
+
+    log = logging.getLogger(__name__)
+
+    def _on_sigterm(signum, _frame):
+        log.warning("Received signal %d — graceful shutdown", signum)
+        if cfg["trading"].get("close_on_shutdown", False):
+            try:
+                trader.force_close()
+            except Exception:
+                log.exception("close_on_shutdown failed")
+        notifier.notify_shutdown(f"(signal {signum})")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     if args.once:
         trader.step()
     else:

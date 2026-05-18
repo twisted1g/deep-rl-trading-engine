@@ -40,6 +40,7 @@ class ObservationBuilder:
         self.lstm_device = lstm_device
 
         self._lstm_encoder = None
+        self._lstm_layernorm = None
         if state_space == "lstm":
             if lstm_checkpoint_path is None:
                 raise ValueError("lstm_checkpoint_path required for state_space=lstm")
@@ -48,7 +49,17 @@ class ObservationBuilder:
             ckpt = Path(lstm_checkpoint_path).expanduser().resolve()
             if not ckpt.exists():
                 raise FileNotFoundError(f"LSTM checkpoint not found: {ckpt}")
-            self._lstm_encoder = load_lstm_encoder(str(ckpt), device=lstm_device)
+            # load_lstm_encoder возвращает (encoder, layernorm).
+            self._lstm_encoder, self._lstm_layernorm = load_lstm_encoder(
+                str(ckpt), device=lstm_device
+            )
+
+    @property
+    def obs_dim(self) -> int:
+        """Размерность observation, как у research-env."""
+        if self.state_space == "baseline":
+            return 9
+        return self.lstm_hidden_size + 4
 
     def min_history(self) -> int:
         """Сколько свечей минимум нужно в df."""
@@ -83,6 +94,10 @@ class ObservationBuilder:
             lstm_encoder=self._lstm_encoder,
             lstm_device=self.lstm_device,
         )
+        # env при передаче готового encoder создаёт свежий, необученный layernorm;
+        # подменяем на обученный из чекпоинта.
+        if self._lstm_layernorm is not None:
+            env.lstm_layernorm = self._lstm_layernorm
         env.current_step = len(df_reset) - 1
         env.position = int(position)
         return env._get_observation().astype(np.float32)

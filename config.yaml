@@ -1,16 +1,19 @@
 exchange:
   testnet: true
-  symbol: BTCUSDT
-  interval: 1h
+  # Hyperliquid: тикер монеты без quote-суффикса (BTC, ETH, SOL).
+  # Код принимает и BTCUSDT/BTC-USDT — конвертирует в BTC автоматически.
+  symbol: BTC
+  interval: 1m
   leverage: 1
-  margin_type: ISOLATED
+  # Hyperliquid: CROSS / ISOLATED.
+  margin_type: CROSS
 
 model:
-  experiment_dir: ../DeepRLTradingResearch/experiments/a2c-baseline/20260517-153458-f0cb0e
-  algo: a2c
-  state_space: baseline
+  experiment_dir: vendor/experiments/ppo-lstm/20260518-152747-11ca2a
+  algo: ppo
+  state_space: lstm
 
-  lstm_checkpoint_path: ../DeepRLTradingResearch/src/encoders/lstm_encoder.pt
+  lstm_checkpoint_path: vendor/encoders/lstm_encoder.pt
   lstm_device: cpu
 
 env:
@@ -21,7 +24,18 @@ env:
 
 trading:
   equity_fraction: 1.0
+  # max_holding_time/poll/grace — в БАРАХ/секундах. Для 5m бара 72 бара = 6 часов.
   max_holding_time: 72
   max_drawdown_threshold: 0.08
   poll_seconds: 30
   bar_close_grace_seconds: 5
+  close_on_shutdown: false
+
+telegram:
+  enabled: true
+  # chat_id из .env (TELEGRAM_CHAT_ID); можно прописать сюда числом для override.
+  chat_id: null
+  commands_enabled: true
+
+persistence:
+  db_path: state/trades.db
