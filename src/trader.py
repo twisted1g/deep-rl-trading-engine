@@ -2,21 +2,25 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import timezone
 from typing import Optional
 
 import pandas as pd
 
-from .exchange import BinanceFutures
+from .exchange import HyperliquidFutures
+from .journal import TradeJournal
 from .model_loader import predict_action
+from .notifier import TelegramNotifier
 from .observation import ObservationBuilder
 
 log = logging.getLogger(__name__)
 
 # Mapping из research-env (см. trading_env_baseline.py:26):
 ACTION_TO_POSITION = {0: 0, 1: 1, 2: -1}
+SIGN_TO_NAME = {1: "long", -1: "short", 0: "flat"}
 
 
 @dataclass
@@ -55,19 +59,51 @@ class PositionState:
 class Trader:
     def __init__(
         self,
-        ex: BinanceFutures,
+        ex: HyperliquidFutures,
         obs_builder: ObservationBuilder,
         model,
         vec_env,
         cfg: TraderConfig,
+        notifier: Optional[TelegramNotifier] = None,
+        journal: Optional[TradeJournal] = None,
     ):
         self.ex = ex
         self.obs_builder = obs_builder
         self.model = model
         self.vec_env = vec_env
         self.cfg = cfg
+        self.notifier = notifier or TelegramNotifier(token=None, chat_id=None, enabled=False)
+        self.journal = journal
         self.state = PositionState()
+        self._lock = threading.RLock()
+        self.paused = False
+        self._open_trade_id: Optional[int] = None
         self._sync_position_from_exchange()
+        self._restore_state()
+
+    def _restore_state(self) -> None:
+        if self.journal is None:
+            return
+        snap = self.journal.load_state()
+        if snap is None:
+            return
+        self.paused = snap.paused
+        if snap.last_processed_bar_time:
+            try:
+                self.state.last_processed_bar_time = pd.Timestamp(
+                    snap.last_processed_bar_time
+                )
+            except Exception:
+                log.warning("could not parse stored bar time: %s",
+                            snap.last_processed_bar_time)
+        # Если на бирже сейчас есть позиция, подвяжем к ней последнюю
+        # незакрытую запись из журнала (для корректного close_trade).
+        if self.state.position != 0:
+            row = self.journal.last_open_trade()
+            if row is not None:
+                self._open_trade_id = int(row["id"])
+        log.info("Restored state: paused=%s last_bar=%s open_trade_id=%s",
+                 self.paused, self.state.last_processed_bar_time, self._open_trade_id)
 
     # ---------- public ----------
 
@@ -83,50 +119,196 @@ class Trader:
                 self.step()
             except KeyboardInterrupt:
                 log.info("Stopped by user")
+                self.notifier.notify_shutdown("(KeyboardInterrupt)")
                 return
-            except Exception:
+            except Exception as exc:
                 log.exception("step failed")
+                self.notifier.notify_error(exc)
                 time.sleep(self.cfg.poll_seconds)
 
     def step(self) -> None:
-        klines = self.ex.fetch_klines(
-            self.cfg.interval, limit=max(self.obs_builder.min_history() + 10, 256)
-        )
-        # последняя свеча от Binance может быть НЕзакрытой — отбросим её,
-        # если её open_time == текущему интервалу.
-        klines = self._drop_open_bar(klines)
-        latest_bar_time = klines.index[-1]
-        latest_close = float(klines["close"].iloc[-1])
+        with self._lock:
+            # --- 0. подхватить ручные изменения позиции через UI биржи
+            self._resync_state_from_exchange()
 
-        # Если бар уже обработан — выходим.
-        if self.state.last_processed_bar_time == latest_bar_time:
-            return
+            klines = self.ex.fetch_klines(
+                self.cfg.interval, limit=max(self.obs_builder.min_history() + 10, 256)
+            )
+            klines = self._drop_open_bar(klines)
+            latest_bar_time = klines.index[-1]
+            latest_close = float(klines["close"].iloc[-1])
 
-        # --- 1. обновить holding_time / max_drawdown по последнему бару
-        self._update_holding_state(latest_close)
+            if self.state.last_processed_bar_time == latest_bar_time:
+                return
 
-        # --- 2. forced exits
-        forced = self._check_forced_exit()
-        if forced:
-            log.info("Forced exit (%s) at %.2f", forced, latest_close)
-            self._close_position()
+            # --- 1. обновить holding_time / max_drawdown по последнему бару
+            self._update_holding_state(latest_close)
+
+            # --- 2. forced exits
+            forced = self._check_forced_exit()
+            if forced:
+                log.info("Forced exit (%s) at %.2f", forced, latest_close)
+                self.notifier.notify_forced_exit(forced, latest_close)
+                self._close_position(exit_price=latest_close, reason=forced)
+                self.state.last_processed_bar_time = latest_bar_time
+                self._persist_state()
+                return
+
+            # --- 3. paused — пропустить predict (но holding_time/forced_exit считались)
+            if self.paused:
+                log.info("bar=%s close=%.2f [paused — skip predict]",
+                         latest_bar_time, latest_close)
+                self.state.last_processed_bar_time = latest_bar_time
+                self._persist_state()
+                return
+
+            # --- 4. observation + predict
+            obs = self.obs_builder.build(klines, position=self.state.position)
+            action = predict_action(self.model, self.vec_env, obs)
+            target = ACTION_TO_POSITION[action]
+            log.info(
+                "bar=%s close=%.2f pos=%+d hold=%d dd=%.4f action=%d target=%+d",
+                latest_bar_time, latest_close, self.state.position,
+                self.state.holding_time, self.state.max_drawdown, action, target,
+            )
+
+            # --- 5. исполнить переход позиций
+            self._transition_to(target, latest_close, latest_bar_time)
+
             self.state.last_processed_bar_time = latest_bar_time
+            self._persist_state()
+
+    def _persist_state(self) -> None:
+        if self.journal is None:
             return
+        try:
+            self.journal.save_state(
+                last_processed_bar_time=(
+                    str(self.state.last_processed_bar_time)
+                    if self.state.last_processed_bar_time is not None else None
+                ),
+                paused=self.paused,
+            )
+        except Exception:
+            log.exception("journal.save_state failed")
 
-        # --- 3. observation + predict
-        obs = self.obs_builder.build(klines, position=self.state.position)
-        action = predict_action(self.model, self.vec_env, obs)
-        target = ACTION_TO_POSITION[action]
-        log.info(
-            "bar=%s close=%.2f pos=%+d hold=%d dd=%.4f action=%d target=%+d",
-            latest_bar_time, latest_close, self.state.position,
-            self.state.holding_time, self.state.max_drawdown, action, target,
+    def set_paused(self, value: bool) -> None:
+        with self._lock:
+            self.paused = bool(value)
+            self._persist_state()
+
+    def status_snapshot(self) -> dict:
+        with self._lock:
+            return {
+                "position": SIGN_TO_NAME[self.state.position],
+                "entry_price": self.state.entry_price,
+                "holding_time": self.state.holding_time,
+                "max_drawdown": self.state.max_drawdown,
+                "last_bar": str(self.state.last_processed_bar_time)
+                if self.state.last_processed_bar_time is not None else None,
+                "paused": self.paused,
+                "symbol": self.cfg.symbol,
+                "interval": self.cfg.interval,
+            }
+
+    def _resync_state_from_exchange(self) -> bool:
+        """Сверяет позицию на бирже с self.state и подстраивает state.
+        Вызывается перед каждым step() — чтобы подхватить ручные операции через UI.
+        Возвращает True, если был замечен и применён рассинхрон.
+        """
+        try:
+            pos = self.ex.position()
+        except Exception as exc:
+            log.warning("periodic position sync failed: %s", exc)
+            return False
+        exchange_sign = 0
+        if abs(pos.amount) > 1e-12:
+            exchange_sign = 1 if pos.amount > 0 else -1
+        if exchange_sign == self.state.position:
+            # Опционально подправляем entry_price, если биржа знает точнее.
+            if exchange_sign != 0 and pos.entry_price > 0:
+                self.state.entry_price = pos.entry_price
+            return False
+        log.warning(
+            "Position mismatch — resyncing: state=%+d exchange=%+d (amount=%.6f entry=%.2f)",
+            self.state.position, exchange_sign, pos.amount, pos.entry_price,
         )
+        # Закрываем висящий журнальный trade, если есть и позиция на бирже теперь другая.
+        if self._open_trade_id is not None and self.journal is not None:
+            try:
+                self.journal.close_trade(
+                    trade_id=self._open_trade_id,
+                    exit_price=self.ex.last_price(),
+                    pnl_pct=0.0,
+                    exit_reason="manual_resync",
+                )
+            except Exception:
+                log.exception("could not close stale journal trade during resync")
+            self._open_trade_id = None
+        # Применяем новое состояние.
+        if exchange_sign == 0:
+            self.state.reset_flat()
+        else:
+            self.state.position = exchange_sign
+            self.state.entry_price = pos.entry_price or self.ex.last_price()
+            self.state.entry_bar_time = None
+            self.state.holding_time = 0
+            self.state.max_drawdown = 0.0
+        self.notifier.notify_error(
+            RuntimeError(
+                f"Position resynced from exchange → {SIGN_TO_NAME[exchange_sign]} "
+                f"@ {self.state.entry_price:.2f}"
+            )
+        )
+        return True
 
-        # --- 4. исполнить переход позиций
-        self._transition_to(target, latest_close, latest_bar_time)
+    def force_resync(self) -> dict:
+        """Принудительный ресинк, вызывается из /sync команды."""
+        with self._lock:
+            changed = self._resync_state_from_exchange()
+            self._persist_state()
+            return {
+                "changed": changed,
+                "position": SIGN_TO_NAME[self.state.position],
+                "entry": self.state.entry_price,
+            }
 
-        self.state.last_processed_bar_time = latest_bar_time
+    def test_open(self, side: str, fraction: float = 0.05) -> dict:
+        """Открывает позицию заданной стороны размером fraction × balance.
+        В обход модели — для smoke-теста перед деплоем.
+        """
+        assert side in ("BUY", "SELL")
+        with self._lock:
+            self._resync_state_from_exchange()
+            if self.state.position != 0:
+                return {"error": f"уже есть позиция: {SIGN_TO_NAME[self.state.position]}"}
+            balance = self.ex.balance_usdt()
+            price = self.ex.last_price()
+            notional = balance * fraction * self.cfg.leverage
+            raw_qty = notional / price
+            qty = self.ex.round_quantity(raw_qty)
+            if qty <= 0:
+                return {"error": f"qty <= 0 (balance={balance:.2f} price={price:.2f})"}
+            sign = 1 if side == "BUY" else -1
+            bar_time = self.state.last_processed_bar_time or pd.Timestamp.now(tz=timezone.utc)
+            self._open_position(side=side, price=price, bar_time=bar_time, sign=sign)
+            return {
+                "ok": True,
+                "side": SIGN_TO_NAME[sign],
+                "qty": qty,
+                "price": self.state.entry_price,
+                "balance_before": balance,
+            }
+
+    def force_close(self) -> Optional[float]:
+        """Закрыть текущую позицию по рынку (вызывается из бота)."""
+        with self._lock:
+            if self.state.position == 0:
+                return None
+            price = self.ex.last_price()
+            self._close_position(exit_price=price, reason="manual")
+            self._persist_state()
+            return price
 
     # ---------- timing ----------
 
@@ -137,20 +319,16 @@ class Trader:
             klines = self._drop_open_bar(klines)
             latest = klines.index[-1]
             if self.state.last_processed_bar_time is None:
-                # первый запуск — сразу обрабатываем
                 return
             if latest > self.state.last_processed_bar_time:
-                # дать рынку миг устаканиться
                 time.sleep(self.cfg.bar_close_grace_seconds)
                 return
             time.sleep(self.cfg.poll_seconds)
 
     @staticmethod
     def _drop_open_bar(klines: pd.DataFrame) -> pd.DataFrame:
-        """Последний kline от Binance может быть текущим, незакрытым баром."""
         if len(klines) < 2:
             return klines
-        # Определяем интервал по разнице последних двух open_time.
         interval = klines.index[-1] - klines.index[-2]
         now = pd.Timestamp.now(tz=timezone.utc)
         if now < klines.index[-1] + interval:
@@ -180,17 +358,30 @@ class Trader:
         return None
 
     def _sync_position_from_exchange(self) -> None:
-        pos = self.ex.position()
+        try:
+            pos = self.ex.position()
+        except Exception as exc:
+            log.warning("position sync failed (%s) — стартую в flat-state, "
+                        "бот будет ждать восстановления связи с биржей", exc)
+            self.notifier.notify_error(exc)
+            self.state.position = 0
+            return
         if abs(pos.amount) < 1e-12:
             self.state.position = 0
         elif pos.amount > 0:
             self.state.position = 1
-            self.state.entry_price = pos.entry_price or self.ex.last_price()
+            try:
+                self.state.entry_price = pos.entry_price or self.ex.last_price()
+            except Exception:
+                self.state.entry_price = pos.entry_price or 0.0
         else:
             self.state.position = -1
-            self.state.entry_price = pos.entry_price or self.ex.last_price()
+            try:
+                self.state.entry_price = pos.entry_price or self.ex.last_price()
+            except Exception:
+                self.state.entry_price = pos.entry_price or 0.0
         log.info(
-            "Synced from exchange: pos=%+d entry=%.2f (binance amt=%.6f)",
+            "Synced from exchange: pos=%+d entry=%.2f (amount=%.6f)",
             self.state.position, self.state.entry_price, pos.amount,
         )
 
@@ -203,9 +394,8 @@ class Trader:
         if target == cur:
             return
 
-        # Сначала закрыть, потом открыть в обратную сторону.
         if cur != 0:
-            self._close_position()
+            self._close_position(exit_price=price, reason="model")
         if target == 1:
             self._open_position(side="BUY", price=price, bar_time=bar_time, sign=1)
         elif target == -1:
@@ -223,14 +413,40 @@ class Trader:
             )
             return
         self.ex.market_order(side, qty)
-        # Подтянем фактическую позицию и entry_price.
         pos = self.ex.position()
         self.state.position = sign
         self.state.entry_price = pos.entry_price or price
         self.state.entry_bar_time = bar_time
         self.state.holding_time = 0
         self.state.max_drawdown = 0.0
+        log.info("Opened %s @ %.2f qty=%.6f", SIGN_TO_NAME[sign], self.state.entry_price, qty)
+        self.notifier.notify_open(SIGN_TO_NAME[sign], self.state.entry_price, qty)
+        if self.journal is not None:
+            self._open_trade_id = self.journal.open_trade(
+                side=SIGN_TO_NAME[sign],
+                qty=qty,
+                entry_price=self.state.entry_price,
+                bar_time=str(bar_time),
+            )
 
-    def _close_position(self) -> None:
+    def _close_position(self, exit_price: float, reason: str = "model") -> None:
+        if self.state.position == 0:
+            return
+        side = SIGN_TO_NAME[self.state.position]
+        entry = self.state.entry_price
+        pnl_pct = 0.0
+        if entry > 0:
+            pnl_pct = (exit_price - entry) / entry * self.state.position
         self.ex.close_position()
+        log.info("Closed %s entry=%.2f exit=%.2f pnl=%+.2f%% (%s)",
+                 side, entry, exit_price, pnl_pct * 100, reason)
+        self.notifier.notify_close(side, entry, exit_price, pnl_pct, reason)
+        if self.journal is not None and self._open_trade_id is not None:
+            self.journal.close_trade(
+                trade_id=self._open_trade_id,
+                exit_price=exit_price,
+                pnl_pct=pnl_pct,
+                exit_reason=reason,
+            )
+            self._open_trade_id = None
         self.state.reset_flat()
