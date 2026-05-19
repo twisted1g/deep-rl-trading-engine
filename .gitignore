@@ -8,3 +8,4 @@ models/*.zip
 logs/
 *.log
 .DS_Store
+state/

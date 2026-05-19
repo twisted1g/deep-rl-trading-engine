@@ -1,0 +1,17 @@
+services:
+  engine:
+    build: .
+    image: deeprl-trading-engine:latest
+    container_name: deeprl-engine
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./state:/app/state
+      - ./config.yaml:/app/config.yaml:ro
+    stop_grace_period: 30s
+    stop_signal: SIGTERM
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
