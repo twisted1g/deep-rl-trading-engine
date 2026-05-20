@@ -1,7 +1,7 @@
-"""Telegram-бот команд: /status /pnl /trades /pause /resume /close.
+"""Telegram command bot: /status /pnl /trades /pause /resume /close.
 
-Запускается в отдельном потоке-демоне со своим asyncio loop. Авторизованы
-только сообщения от заданного chat_id.
+Runs in a daemon thread with its own asyncio loop. Only messages from
+the configured chat_id are processed.
 """
 from __future__ import annotations
 
@@ -13,15 +13,11 @@ from typing import TYPE_CHECKING, Optional
 
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 if TYPE_CHECKING:
-    from .journal import TradeJournal
-    from .trader import Trader
+    from ..persistence.journal import TradeJournal
+    from ..core.trader import Trader
 
 log = logging.getLogger(__name__)
 
@@ -78,11 +74,10 @@ class CommandBot:
         await app.initialize()
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
-        # Держим loop живым.
         while True:
             await asyncio.sleep(3600)
 
-    # ---------- handlers ----------
+    # ---------- auth ----------
 
     def _authorized(self, update: Update) -> bool:
         cid = update.effective_chat.id if update.effective_chat else None
@@ -91,19 +86,21 @@ class CommandBot:
             return False
         return True
 
+    # ---------- handlers ----------
+
     async def _cmd_help(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
         await update.message.reply_text(
-            "/status — текущая позиция\n"
-            "/pnl — статистика по сделкам\n"
-            "/trades [N] — последние N сделок (default 10)\n"
-            "/pause — выключить вход в новые позиции\n"
-            "/resume — включить обратно\n"
-            "/close — закрыть текущую позицию по рынку\n"
-            "/sync — подтянуть позицию с биржи (если открывали вручную)\n"
-            "/testlong [frac] — открыть тестовый long (default 5% баланса)\n"
-            "/testshort [frac] — открыть тестовый short"
+            "/status — current position\n"
+            "/pnl — trade statistics\n"
+            "/trades [N] — last N trades (default 10)\n"
+            "/pause — disable new position entries\n"
+            "/resume — re-enable entries\n"
+            "/close — close current position at market\n"
+            "/sync — resync position from exchange\n"
+            "/testlong [frac] — open test long (default 5% of balance)\n"
+            "/testshort [frac] — open test short"
         )
 
     async def _cmd_status(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -125,7 +122,7 @@ class CommandBot:
         if not self._authorized(update):
             return
         if self.journal is None:
-            await update.message.reply_text("journal не настроен")
+            await update.message.reply_text("journal not configured")
             return
         st = self.journal.stats()
         await update.message.reply_html(
@@ -140,7 +137,7 @@ class CommandBot:
         if not self._authorized(update):
             return
         if self.journal is None:
-            await update.message.reply_text("journal не настроен")
+            await update.message.reply_text("journal not configured")
             return
         n = 10
         if ctx.args:
@@ -150,7 +147,7 @@ class CommandBot:
                 pass
         rows = self.journal.recent(n)
         if not rows:
-            await update.message.reply_text("сделок пока нет")
+            await update.message.reply_text("no trades yet")
             return
         lines = []
         for r in rows:
@@ -167,7 +164,7 @@ class CommandBot:
         if not self._authorized(update):
             return
         self.trader.set_paused(True)
-        await update.message.reply_text("⏸ paused (forced exits всё ещё работают)")
+        await update.message.reply_text("⏸ paused (forced exits still active)")
 
     async def _cmd_resume(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
@@ -181,7 +178,7 @@ class CommandBot:
         loop = asyncio.get_event_loop()
         price = await loop.run_in_executor(None, self.trader.force_close)
         if price is None:
-            await update.message.reply_text("позиции нет")
+            await update.message.reply_text("no open position")
         else:
             await update.message.reply_text(f"closed @ {price:.2f}")
 
@@ -191,8 +188,9 @@ class CommandBot:
     async def _cmd_testshort(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await self._cmd_testopen(update, ctx, side="SELL")
 
-    async def _cmd_testopen(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE,
-                            side: str) -> None:
+    async def _cmd_testopen(
+        self, update: Update, ctx: ContextTypes.DEFAULT_TYPE, side: str
+    ) -> None:
         if not self._authorized(update):
             return
         frac = 0.05
@@ -202,9 +200,7 @@ class CommandBot:
             except ValueError:
                 pass
         loop = asyncio.get_event_loop()
-        res = await loop.run_in_executor(
-            None, lambda: self.trader.test_open(side, frac)
-        )
+        res = await loop.run_in_executor(None, lambda: self.trader.test_open(side, frac))
         if "error" in res:
             await update.message.reply_text(f"❌ {res['error']}")
             return

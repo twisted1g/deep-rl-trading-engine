@@ -1,10 +1,4 @@
-"""Построение observation для live-инференса — 1-в-1 с research-средой.
-
-Стратегия: инстанцируем настоящий env-класс (`MyTradingEnv` или
-`MyTradingEnvLSTM`) с последним срезом свечей, выставляем
-`current_step` на последнюю свечу и текущую отслеживаемую позицию,
-дёргаем `_get_observation()`. Никакого step()-логирования не происходит.
-"""
+"""Build observations for live inference — mirrors the research environment exactly."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -13,7 +7,7 @@ from typing import Literal, Optional
 import numpy as np
 import pandas as pd
 
-from . import research_bridge  # noqa: F401 — bootstrap sys.path
+from ..model import bridge  # noqa: F401 — bootstrap vendor sys.path
 from env.trading_env_baseline import MyTradingEnv
 from env.trading_env_lstm import MyTradingEnvLSTM
 
@@ -49,26 +43,23 @@ class ObservationBuilder:
             ckpt = Path(lstm_checkpoint_path).expanduser().resolve()
             if not ckpt.exists():
                 raise FileNotFoundError(f"LSTM checkpoint not found: {ckpt}")
-            # load_lstm_encoder возвращает (encoder, layernorm).
             self._lstm_encoder, self._lstm_layernorm = load_lstm_encoder(
                 str(ckpt), device=lstm_device
             )
 
     @property
     def obs_dim(self) -> int:
-        """Размерность observation, как у research-env."""
         if self.state_space == "baseline":
             return 9
         return self.lstm_hidden_size + 4
 
     def min_history(self) -> int:
-        """Сколько свечей минимум нужно в df."""
         if self.state_space == "baseline":
             return self.feature_window + 2
         return self.lstm_window_size + self.feature_window + 2
 
     def build(self, df: pd.DataFrame, position: int) -> np.ndarray:
-        """df: свечи (open/high/low/close/volume), последняя — самая свежая закрытая."""
+        """df: OHLCV candles, last row = most recent closed bar."""
         if "close" not in df.columns or "volume" not in df.columns:
             raise ValueError("df must contain 'close' and 'volume' columns")
         if len(df) < self.min_history():
@@ -84,7 +75,6 @@ class ObservationBuilder:
             env.position = int(position)
             return env._get_observation().astype(np.float32)
 
-        # lstm
         env = MyTradingEnvLSTM(
             df=df_reset,
             feature_window=self.feature_window,
@@ -94,8 +84,6 @@ class ObservationBuilder:
             lstm_encoder=self._lstm_encoder,
             lstm_device=self.lstm_device,
         )
-        # env при передаче готового encoder создаёт свежий, необученный layernorm;
-        # подменяем на обученный из чекпоинта.
         if self._lstm_layernorm is not None:
             env.lstm_layernorm = self._lstm_layernorm
         env.current_step = len(df_reset) - 1

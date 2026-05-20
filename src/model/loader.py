@@ -1,4 +1,4 @@
-"""Загрузка SB3 модели + VecNormalize. Поддержка Dueling DQN."""
+"""SB3 model + VecNormalize loading and inference. Supports Dueling DQN."""
 from __future__ import annotations
 
 import logging
@@ -8,7 +8,7 @@ from typing import Any, Literal, Tuple
 import numpy as np
 from gymnasium import Env, spaces
 
-from . import research_bridge  # noqa: F401
+from . import bridge  # noqa: F401 — bootstrap vendor sys.path
 
 log = logging.getLogger(__name__)
 
@@ -16,8 +16,7 @@ Algo = Literal["a2c", "ppo", "dqn", "dueling_dqn"]
 
 
 class _DummyObsEnv(Env):
-    """Минимальный gym Env, нужен только чтобы VecNormalize.load мог обернуть
-    его (он смотрит observation_space/action_space)."""
+    """Minimal gym Env used only so VecNormalize.load can wrap it."""
 
     metadata = {"render_modes": []}
 
@@ -33,10 +32,7 @@ class _DummyObsEnv(Env):
     def step(self, action):
         return (
             np.zeros(self.observation_space.shape, dtype=np.float32),
-            0.0,
-            True,
-            False,
-            {},
+            0.0, True, False, {},
         )
 
 
@@ -46,7 +42,7 @@ def load_model_and_vecnorm(
     vecnorm_path: str | Path,
     obs_dim: int,
 ) -> Tuple[Any, Any]:
-    """Возвращает (model, vec_env_with_normalize)."""
+    """Return (model, vec_env_with_normalize)."""
     from stable_baselines3 import A2C, DQN, PPO
     from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -65,7 +61,6 @@ def load_model_and_vecnorm(
     custom_objects: dict = {}
     if algo == "dueling_dqn":
         from agents.dueling_dqn_policy import DuelingDQNPolicy
-
         custom_objects["policy_class"] = DuelingDQNPolicy
 
     algo_cls = {"a2c": A2C, "ppo": PPO, "dqn": DQN, "dueling_dqn": DQN}[algo]
@@ -77,7 +72,7 @@ def load_model_and_vecnorm(
 
 
 def predict_action(model: Any, vec_env: Any, raw_obs: np.ndarray) -> int:
-    """raw_obs: 1D массив. Нормализует через VecNormalize и зовёт model.predict."""
+    """Normalize raw 1D obs via VecNormalize and return the predicted action."""
     obs_batched = raw_obs.reshape(1, -1).astype(np.float32)
     obs_norm = vec_env.normalize_obs(obs_batched)
     action, _ = model.predict(obs_norm, deterministic=True)

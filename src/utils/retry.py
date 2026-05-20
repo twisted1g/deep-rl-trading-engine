@@ -1,8 +1,4 @@
-"""Простой retry-декоратор с exponential backoff и jitter.
-
-Применяется к вызовам Binance API. Не-retryable исключения (валидация,
-insufficient margin и т.п.) пробрасываются сразу.
-"""
+"""Retry decorator with exponential backoff and jitter."""
 from __future__ import annotations
 
 import functools
@@ -28,7 +24,6 @@ def with_retry(
     max_delay: float = 30.0,
     retryable: Tuple[Type[BaseException], ...] = (Exception,),
     non_retryable_codes: Tuple[str, ...] = (
-        # Hyperliquid: ошибки приходят как text в response payload.
         "insufficient margin",
         "insufficient balance",
         "Order has invalid",

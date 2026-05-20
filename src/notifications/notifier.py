@@ -1,8 +1,4 @@
-"""Telegram push-уведомления о торговых событиях.
-
-Реализация — синхронный POST на Bot API через httpx. Никакого asyncio в
-торговом цикле; ошибки отправки только логируются.
-"""
+"""Telegram push notifications for trading events (sync, no asyncio)."""
 from __future__ import annotations
 
 import html
@@ -38,11 +34,11 @@ class TelegramNotifier:
         token = os.environ.get("TELEGRAM_BOT_TOKEN")
         cid = chat_id or os.environ.get("TELEGRAM_CHAT_ID")
         if enabled and (not token or not cid):
-            log.warning("Telegram enabled, но TELEGRAM_BOT_TOKEN/CHAT_ID не заданы — отключаю")
+            log.warning("Telegram enabled but BOT_TOKEN/CHAT_ID not set — disabling")
             enabled = False
         return cls(token=token, chat_id=cid, enabled=enabled)
 
-    # ---------- public events ----------
+    # ---------- events ----------
 
     def notify_startup(self, summary: str) -> None:
         self._send(f"🚀 <b>engine started</b>\n{html.escape(summary)}")

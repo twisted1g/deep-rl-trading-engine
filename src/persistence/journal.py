@@ -1,10 +1,4 @@
-"""SQLite-журнал сделок и snapshot состояния трейдера.
-
-Используется:
-- `_open_position` / `_close_position` для записи сделок,
-- `step()` для сохранения `last_processed_bar_time` / `paused`,
-- TG-командами `/pnl` и `/trades` для чтения.
-"""
+"""SQLite trade journal and trader state snapshot."""
 from __future__ import annotations
 
 import logging

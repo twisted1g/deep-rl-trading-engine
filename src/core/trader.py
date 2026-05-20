@@ -1,4 +1,4 @@
-"""Live-trader loop: 1h bar-close → obs → predict → execute."""
+"""Live trading loop: 1h bar-close → observation → predict → execute."""
 from __future__ import annotations
 
 import logging
@@ -10,15 +10,15 @@ from typing import Optional
 
 import pandas as pd
 
-from .exchange import HyperliquidFutures
-from .journal import TradeJournal
-from .model_loader import predict_action
-from .notifier import TelegramNotifier
+from ..exchange.client import HyperliquidFutures
+from ..model.loader import predict_action
+from ..notifications.notifier import TelegramNotifier
+from ..persistence.journal import TradeJournal
 from .observation import ObservationBuilder
 
 log = logging.getLogger(__name__)
 
-# Mapping из research-env (см. trading_env_baseline.py:26):
+# Maps research-env action integers (trading_env_baseline.py:26) to position signs.
 ACTION_TO_POSITION = {0: 0, 1: 1, 2: -1}
 SIGN_TO_NAME = {1: "long", -1: "short", 0: "flat"}
 
@@ -27,24 +27,21 @@ SIGN_TO_NAME = {1: "long", -1: "short", 0: "flat"}
 class TraderConfig:
     symbol: str
     interval: str = "1h"
-    # equity sizing
-    equity_fraction: float = 1.0       # 100% balance, как в обучении
+    equity_fraction: float = 1.0
     leverage: int = 1
-    # forced exits (как в env)
     max_holding_time: int = 72
     max_drawdown_threshold: float = 0.08
-    # poll
     poll_seconds: int = 30
     bar_close_grace_seconds: int = 5
 
 
 @dataclass
 class PositionState:
-    """Виртуальное состояние позиции, согласованное с семантикой env."""
-    position: int = 0                  # -1 short, 0 flat, 1 long
+    """Virtual position state mirroring research-env semantics."""
+    position: int = 0          # -1 short, 0 flat, 1 long
     entry_price: float = 0.0
     entry_bar_time: Optional[pd.Timestamp] = None
-    holding_time: int = 0              # в барах
+    holding_time: int = 0      # in bars
     max_drawdown: float = 0.0
     last_processed_bar_time: Optional[pd.Timestamp] = None
 
@@ -96,8 +93,6 @@ class Trader:
             except Exception:
                 log.warning("could not parse stored bar time: %s",
                             snap.last_processed_bar_time)
-        # Если на бирже сейчас есть позиция, подвяжем к ней последнюю
-        # незакрытую запись из журнала (для корректного close_trade).
         if self.state.position != 0:
             row = self.journal.last_open_trade()
             if row is not None:
@@ -128,7 +123,6 @@ class Trader:
 
     def step(self) -> None:
         with self._lock:
-            # --- 0. подхватить ручные изменения позиции через UI биржи
             self._resync_state_from_exchange()
 
             klines = self.ex.fetch_klines(
@@ -141,10 +135,8 @@ class Trader:
             if self.state.last_processed_bar_time == latest_bar_time:
                 return
 
-            # --- 1. обновить holding_time / max_drawdown по последнему бару
             self._update_holding_state(latest_close)
 
-            # --- 2. forced exits
             forced = self._check_forced_exit()
             if forced:
                 log.info("Forced exit (%s) at %.2f", forced, latest_close)
@@ -154,7 +146,6 @@ class Trader:
                 self._persist_state()
                 return
 
-            # --- 3. paused — пропустить predict (но holding_time/forced_exit считались)
             if self.paused:
                 log.info("bar=%s close=%.2f [paused — skip predict]",
                          latest_bar_time, latest_close)
@@ -162,7 +153,6 @@ class Trader:
                 self._persist_state()
                 return
 
-            # --- 4. observation + predict
             obs = self.obs_builder.build(klines, position=self.state.position)
             action = predict_action(self.model, self.vec_env, obs)
             target = ACTION_TO_POSITION[action]
@@ -172,25 +162,9 @@ class Trader:
                 self.state.holding_time, self.state.max_drawdown, action, target,
             )
 
-            # --- 5. исполнить переход позиций
             self._transition_to(target, latest_close, latest_bar_time)
-
             self.state.last_processed_bar_time = latest_bar_time
             self._persist_state()
-
-    def _persist_state(self) -> None:
-        if self.journal is None:
-            return
-        try:
-            self.journal.save_state(
-                last_processed_bar_time=(
-                    str(self.state.last_processed_bar_time)
-                    if self.state.last_processed_bar_time is not None else None
-                ),
-                paused=self.paused,
-            )
-        except Exception:
-            log.exception("journal.save_state failed")
 
     def set_paused(self, value: bool) -> None:
         with self._lock:
@@ -211,59 +185,16 @@ class Trader:
                 "interval": self.cfg.interval,
             }
 
-    def _resync_state_from_exchange(self) -> bool:
-        """Сверяет позицию на бирже с self.state и подстраивает state.
-        Вызывается перед каждым step() — чтобы подхватить ручные операции через UI.
-        Возвращает True, если был замечен и применён рассинхрон.
-        """
-        try:
-            pos = self.ex.position()
-        except Exception as exc:
-            log.warning("periodic position sync failed: %s", exc)
-            return False
-        exchange_sign = 0
-        if abs(pos.amount) > 1e-12:
-            exchange_sign = 1 if pos.amount > 0 else -1
-        if exchange_sign == self.state.position:
-            # Опционально подправляем entry_price, если биржа знает точнее.
-            if exchange_sign != 0 and pos.entry_price > 0:
-                self.state.entry_price = pos.entry_price
-            return False
-        log.warning(
-            "Position mismatch — resyncing: state=%+d exchange=%+d (amount=%.6f entry=%.2f)",
-            self.state.position, exchange_sign, pos.amount, pos.entry_price,
-        )
-        # Закрываем висящий журнальный trade, если есть и позиция на бирже теперь другая.
-        if self._open_trade_id is not None and self.journal is not None:
-            try:
-                self.journal.close_trade(
-                    trade_id=self._open_trade_id,
-                    exit_price=self.ex.last_price(),
-                    pnl_pct=0.0,
-                    exit_reason="manual_resync",
-                )
-            except Exception:
-                log.exception("could not close stale journal trade during resync")
-            self._open_trade_id = None
-        # Применяем новое состояние.
-        if exchange_sign == 0:
-            self.state.reset_flat()
-        else:
-            self.state.position = exchange_sign
-            self.state.entry_price = pos.entry_price or self.ex.last_price()
-            self.state.entry_bar_time = None
-            self.state.holding_time = 0
-            self.state.max_drawdown = 0.0
-        self.notifier.notify_error(
-            RuntimeError(
-                f"Position resynced from exchange → {SIGN_TO_NAME[exchange_sign]} "
-                f"@ {self.state.entry_price:.2f}"
-            )
-        )
-        return True
+    def force_close(self) -> Optional[float]:
+        with self._lock:
+            if self.state.position == 0:
+                return None
+            price = self.ex.last_price()
+            self._close_position(exit_price=price, reason="manual")
+            self._persist_state()
+            return price
 
     def force_resync(self) -> dict:
-        """Принудительный ресинк, вызывается из /sync команды."""
         with self._lock:
             changed = self._resync_state_from_exchange()
             self._persist_state()
@@ -274,14 +205,12 @@ class Trader:
             }
 
     def test_open(self, side: str, fraction: float = 0.05) -> dict:
-        """Открывает позицию заданной стороны размером fraction × balance.
-        В обход модели — для smoke-теста перед деплоем.
-        """
+        """Open a position bypassing the model — for smoke-testing before deploy."""
         assert side in ("BUY", "SELL")
         with self._lock:
             self._resync_state_from_exchange()
             if self.state.position != 0:
-                return {"error": f"уже есть позиция: {SIGN_TO_NAME[self.state.position]}"}
+                return {"error": f"position already open: {SIGN_TO_NAME[self.state.position]}"}
             balance = self.ex.balance_usdt()
             price = self.ex.last_price()
             notional = balance * fraction * self.cfg.leverage
@@ -300,20 +229,9 @@ class Trader:
                 "balance_before": balance,
             }
 
-    def force_close(self) -> Optional[float]:
-        """Закрыть текущую позицию по рынку (вызывается из бота)."""
-        with self._lock:
-            if self.state.position == 0:
-                return None
-            price = self.ex.last_price()
-            self._close_position(exit_price=price, reason="manual")
-            self._persist_state()
-            return price
-
     # ---------- timing ----------
 
     def _wait_for_new_bar(self) -> None:
-        """Спим, опрашивая, пока не появится новая закрытая свеча."""
         while True:
             klines = self.ex.fetch_klines(self.cfg.interval, limit=3)
             klines = self._drop_open_bar(klines)
@@ -335,7 +253,7 @@ class Trader:
             return klines.iloc[:-1]
         return klines
 
-    # ---------- state ----------
+    # ---------- position state ----------
 
     def _update_holding_state(self, current_price: float) -> None:
         if self.state.position == 0:
@@ -361,8 +279,7 @@ class Trader:
         try:
             pos = self.ex.position()
         except Exception as exc:
-            log.warning("position sync failed (%s) — стартую в flat-state, "
-                        "бот будет ждать восстановления связи с биржей", exc)
+            log.warning("position sync failed (%s) — starting in flat-state", exc)
             self.notifier.notify_error(exc)
             self.state.position = 0
             return
@@ -385,6 +302,55 @@ class Trader:
             self.state.position, self.state.entry_price, pos.amount,
         )
 
+    def _resync_state_from_exchange(self) -> bool:
+        """Check exchange position vs internal state; apply any manual changes.
+
+        Called before each step() to pick up trades placed via the exchange UI.
+        Returns True if a mismatch was detected and applied.
+        """
+        try:
+            pos = self.ex.position()
+        except Exception as exc:
+            log.warning("periodic position sync failed: %s", exc)
+            return False
+        exchange_sign = 0
+        if abs(pos.amount) > 1e-12:
+            exchange_sign = 1 if pos.amount > 0 else -1
+        if exchange_sign == self.state.position:
+            if exchange_sign != 0 and pos.entry_price > 0:
+                self.state.entry_price = pos.entry_price
+            return False
+        log.warning(
+            "Position mismatch — resyncing: state=%+d exchange=%+d (amount=%.6f entry=%.2f)",
+            self.state.position, exchange_sign, pos.amount, pos.entry_price,
+        )
+        if self._open_trade_id is not None and self.journal is not None:
+            try:
+                self.journal.close_trade(
+                    trade_id=self._open_trade_id,
+                    exit_price=self.ex.last_price(),
+                    pnl_pct=0.0,
+                    exit_reason="manual_resync",
+                )
+            except Exception:
+                log.exception("could not close stale journal trade during resync")
+            self._open_trade_id = None
+        if exchange_sign == 0:
+            self.state.reset_flat()
+        else:
+            self.state.position = exchange_sign
+            self.state.entry_price = pos.entry_price or self.ex.last_price()
+            self.state.entry_bar_time = None
+            self.state.holding_time = 0
+            self.state.max_drawdown = 0.0
+        self.notifier.notify_error(
+            RuntimeError(
+                f"Position resynced from exchange → {SIGN_TO_NAME[exchange_sign]} "
+                f"@ {self.state.entry_price:.2f}"
+            )
+        )
+        return True
+
     # ---------- execution ----------
 
     def _transition_to(
@@ -393,7 +359,6 @@ class Trader:
         cur = self.state.position
         if target == cur:
             return
-
         if cur != 0:
             self._close_position(exit_price=price, reason="model")
         if target == 1:
@@ -401,7 +366,9 @@ class Trader:
         elif target == -1:
             self._open_position(side="SELL", price=price, bar_time=bar_time, sign=-1)
 
-    def _open_position(self, side: str, price: float, bar_time: pd.Timestamp, sign: int) -> None:
+    def _open_position(
+        self, side: str, price: float, bar_time: pd.Timestamp, sign: int
+    ) -> None:
         balance = self.ex.balance_usdt()
         notional = balance * self.cfg.equity_fraction * self.cfg.leverage
         raw_qty = notional / price
@@ -450,3 +417,17 @@ class Trader:
             )
             self._open_trade_id = None
         self.state.reset_flat()
+
+    def _persist_state(self) -> None:
+        if self.journal is None:
+            return
+        try:
+            self.journal.save_state(
+                last_processed_bar_time=(
+                    str(self.state.last_processed_bar_time)
+                    if self.state.last_processed_bar_time is not None else None
+                ),
+                paused=self.paused,
+            )
+        except Exception:
+            log.exception("journal.save_state failed")
